@@ -52,7 +52,7 @@ export function BuildProgress({
                   <span className="build-marker">{status === "done" ? "✓" : i + 1}</span>
                   <div className="build-step-body">
                     <div className="build-step-label">{step.label}</div>
-                    {status === "active" && detail && <div className="build-step-detail">{detail}</div>}
+                    {status === "active" && detail && detail !== step.label && <div className="build-step-detail">{detail}</div>}
                   </div>
                 </li>
               );
@@ -76,7 +76,7 @@ export function BuildProgress({
         <div className="build-panel">
           <div className="build-eyebrow">Agent</div>
           <div className="build-narration" ref={narrRef}>
-            {narration || "Warming up — reading what you’ve been browsing…"}
+            {narration || "Warming up. Reading what you’ve been browsing…"}
           </div>
 
           {logs.length > 0 && (

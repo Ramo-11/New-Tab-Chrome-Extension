@@ -2,14 +2,13 @@ import { BuildManager } from "@/lib/build-manager";
 import { AGENT_PORT } from "@/lib/protocol";
 
 /**
- * The service worker is the build host. It owns the agent loop (BuildManager),
- * holds the Anthropic session stream, runs the browser tools in-process, and
- * drives the scheduled rebuild from an alarm.
+ * The service worker is the build host. It owns the build (BuildManager), runs
+ * the browser steps in-process, and drives the scheduled rebuild from an alarm.
  *
  * New-tab pages are thin views that connect on AGENT_PORT. Closing every tab
- * doesn't stop a build: the worker keeps itself warm during an active turn, and
- * the alarm heartbeat reattaches to an interrupted session after an unexpected
- * kill.
+ * doesn't stop a build: the worker keeps itself warm while one runs, and the
+ * alarm heartbeat resumes an interrupted build from its checkpoint after an
+ * unexpected kill.
  */
 const HEARTBEAT_ALARM = "homepage-heartbeat";
 
@@ -30,7 +29,7 @@ export default defineBackground(() => {
   browser.runtime.onStartup.addListener(() => void manager.tick());
   browser.runtime.onInstalled.addListener(() => void manager.tick());
 
-  // On every wake, reattach to an interrupted build (or consider a scheduled
+  // On every wake, resume an interrupted build (or consider a scheduled
   // rebuild) immediately rather than waiting for the first alarm.
   void manager.tick();
 });

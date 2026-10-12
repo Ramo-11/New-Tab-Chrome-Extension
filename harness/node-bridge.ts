@@ -1,16 +1,7 @@
-/**
- * A BrowserBridge backed by fixtures + fetch, for verifying the agent pipeline
- * outside Chrome. The extension supplies the real one (chrome.history / tabs).
- *
- * This is a test harness, not a fallback: it cannot see authenticated or
- * JS-rendered pages, which is the entire reason getPageHtml runs in the user's
- * browser in production.
- */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BrowserBridge, KVStore, RawSiteMetadata } from "@homepage/agent-core";
 
-/** Harness state (cached agent/environment IDs, active session) and output, next to these scripts. */
 export const STATE_PATH = join(import.meta.dir, ".agent-state.json");
 export const OUT_DIR = join(import.meta.dir, "out");
 export const OUT_PATH = join(OUT_DIR, "homepage.tsx");
@@ -44,9 +35,6 @@ export class FileKVStore implements KVStore {
   }
 }
 
-const DAY = 24 * 60 * 60 * 1000;
-
-/** Stand-in for what the extension's lib/history.ts produces from chrome.history. */
 export function fixtureHistory(now = Date.now()): RawSiteMetadata[] {
   const make = (
     domain: string,
@@ -80,7 +68,6 @@ export function fixtureHistory(now = Date.now()): RawSiteMetadata[] {
   ];
 }
 
-/** Crude sanitizer approximating the extension's cleanHtmlForLLM (lib/scraper.ts). */
 function cleanHtml(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, "")
@@ -93,7 +80,7 @@ function cleanHtml(html: string): string {
 
 function titleOf(html: string, url: string): string {
   const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  return m ? m[1].trim().slice(0, 200) : url;
+  return m ? m[1]!.trim().slice(0, 200) : url;
 }
 
 export const nodeBridge: BrowserBridge = {
@@ -103,7 +90,7 @@ export const nodeBridge: BrowserBridge = {
   },
 
   async getPageHtml({ urls }) {
-    const pages: Array<{ url: string; title: string; html: string }> = [];
+    const pages: Array<{ url: string; finalUrl?: string; title: string; html: string }> = [];
     const failed: Array<{ url: string; reason: string }> = [];
 
     await Promise.all(
@@ -118,7 +105,7 @@ export const nodeBridge: BrowserBridge = {
             return;
           }
           const raw = await res.text();
-          pages.push({ url, title: titleOf(raw, url), html: cleanHtml(raw) });
+          pages.push({ url, finalUrl: res.url || url, title: titleOf(raw, url), html: cleanHtml(raw) });
         } catch (err) {
           failed.push({ url, reason: String(err) });
         }

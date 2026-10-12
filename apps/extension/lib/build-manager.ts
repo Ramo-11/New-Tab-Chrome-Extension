@@ -1,5 +1,4 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { runHomepageBuild, type RunPhase } from "@homepage/agent-core";
+import { discardStaleCheckpoint, isAbortError, runHomepageBuild, type RunPhase } from "@homepage/agent-core";
 import { rebuildIntervalMs, shouldAutoRebuild } from "./auto-rebuild";
 import { browserBridge } from "./browser-bridge";
 import {
@@ -11,30 +10,14 @@ import {
   type PageMsg,
 } from "./protocol";
 import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
+import { findSyntaxError } from "./transpile";
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
 
-/**
- * While a turn is active, ping a cheap chrome API on this interval to reset the
- * ~30s MV3 idle-unload timer. The ~1 min alarm heartbeat is the slower safety
- * net that reattaches after an unexpected kill.
- */
 const KEEPALIVE_INTERVAL_MS = 20_000;
-
-/** Storage snapshots are throttled so narration deltas don't flood chrome.storage. */
 const SNAPSHOT_THROTTLE_MS = 2_000;
-/** A late-joining tab doesn't need the whole narration, just enough to look alive. */
 const NARRATION_STORAGE_CAP = 2_000;
 
-/**
- * Owns the single build. Runs `runHomepageBuild` in the worker, holds live state,
- * enforces a single-flight lock, broadcasts progress to every connected tab,
- * mirrors a throttled snapshot to storage, and reattaches to an interrupted run
- * on wake.
- *
- * There is one instance per service worker — i.e. one per browser profile — so
- * single-flight is per-profile, which is the right grain.
- */
 export class BuildManager {
   private state: BuildState = { ...INITIAL_BUILD_STATE };
   private readonly ports = new Set<Port>();
@@ -43,8 +26,6 @@ export class BuildManager {
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private lastSnapshotAt = 0;
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
-
-  // ---- port lifecycle ------------------------------------------------------
 
   attach(port: Port) {
     this.ports.add(port);
@@ -70,7 +51,6 @@ export class BuildManager {
     try {
       port.postMessage(msg);
     } catch {
-      // Port went away between the has-check and the post; drop it.
       this.ports.delete(port);
     }
   }
@@ -79,32 +59,25 @@ export class BuildManager {
     for (const port of [...this.ports]) this.send(port, msg);
   }
 
-  // ---- heartbeat -----------------------------------------------------------
-
-  /**
-   * Called on worker wake and on every alarm tick. If a session was left
-   * mid-flight, reattach and continue (lossless — the orchestrator replays the
-   * event log and re-answers orphaned tool calls). Otherwise, consider the daily
-   * rebuild. The single-flight lock is the arbiter that keeps these from racing.
-   */
   async tick() {
     if (this.running) {
-      // A run is live but the worker may have just woken; make sure the
-      // self-keepalive is ticking so the active turn stays warm.
       this.startKeepalive();
       return;
     }
 
-    const sessionId = await extensionStore.get<string>(KEYS.activeSessionId);
-    if (sessionId) {
-      void this.startBuild({ resume: true });
-      return;
+    await discardStaleCheckpoint(extensionStore);
+    const checkpoint = await extensionStore.get<unknown>(KEYS.buildCheckpoint);
+    if (checkpoint !== undefined) {
+      const { apiKey } = await loadSettings();
+      if (apiKey) {
+        void this.startBuild({ resume: true });
+        return;
+      }
     }
 
     await this.maybeAutoRebuild();
   }
 
-  /** Whether opening the day's first tab should already show a fresh homepage. */
   private async maybeAutoRebuild() {
     const [settings, homepage, lastAttempt] = await Promise.all([
       loadSettings(),
@@ -127,56 +100,44 @@ export class BuildManager {
       return;
     }
 
-    // Stamp the attempt before starting so a second wake (or a cancel/failure)
-    // doesn't re-trigger it within the interval.
     await extensionStore.set(KEYS.lastAutoBuildAttempt, now.toISOString());
     void this.startBuild({ resume: false });
   }
 
-  // ---- the build -----------------------------------------------------------
-
   async startBuild(opts: { resume?: boolean } = {}) {
     if (this.running) {
-      console.log("[BuildManager] startBuild ignored — a build is already running");
-      return; // single-flight: a second start just attaches.
-    }
-
-    const { apiKey, systemPrompt, model } = await loadSettings();
-    if (!apiKey) {
-      // Manual builds are gated behind the key-setup screen and auto-builds
-      // require a key, so this only happens if the key was removed.
-      console.warn("[BuildManager] startBuild aborted — no API key in storage");
-      const message = "No Anthropic API key found. Add your key and try again.";
-      this.state = { ...INITIAL_BUILD_STATE, phase: "error", error: message };
-      this.broadcast({ kind: "error", message });
+      console.log("[BuildManager] startBuild ignored, a build is already running");
       return;
     }
-
     this.running = true;
-    this.controller = new AbortController();
-    this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup" };
-    this.broadcast({ kind: "snapshot", state: this.state });
-    this.startKeepalive();
-    console.log("[BuildManager] build started", { resume: Boolean(opts.resume) });
 
     try {
-      // The key is the user's own, read from local storage — there is no server
-      // to hide it behind. See ARCHITECTURE.md → Privacy.
-      const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
+      const { apiKey, systemPrompt, model, newsSources } = await loadSettings();
+      if (!apiKey) {
+        console.warn("[BuildManager] startBuild aborted, no API key in storage");
+        const message = "No Google API key found. Add your key and try again.";
+        this.state = { ...INITIAL_BUILD_STATE, phase: "error", error: message };
+        this.broadcast({ kind: "error", message });
+        return;
+      }
 
-      const resumeSessionId = opts.resume
-        ? await extensionStore.get<string>(KEYS.activeSessionId)
-        : undefined;
+      this.controller = new AbortController();
+      this.state = { ...INITIAL_BUILD_STATE, running: true, phase: "setup" };
+      this.broadcast({ kind: "snapshot", state: this.state });
+      this.startKeepalive();
+      console.log("[BuildManager] build started", { resume: Boolean(opts.resume) });
 
       const result = await runHomepageBuild({
-        client,
+        apiKey,
         bridge: browserBridge,
         store: extensionStore,
         userSystemPrompt: systemPrompt,
         blockedSites: async () => (await loadSettings()).blockedSites,
         model,
-        resumeSessionId,
+        newsSources,
+        resume: opts.resume,
         signal: this.controller.signal,
+        checkSyntax: findSyntaxError,
         callbacks: {
           onPhase: (phase, detail) => this.onPhase(phase, detail),
           onText: (chunk) => this.onText(chunk),
@@ -184,14 +145,24 @@ export class BuildManager {
         },
       });
 
-      // Persist the raw TSX; the page transpiles it for preview.
       await saveHomepage(result.code);
 
       this.state = { ...this.state, running: false, phase: "done" };
       this.broadcast({ kind: "done", code: result.code });
       await this.mirror(true);
-      console.log("[BuildManager] build done", { bytes: result.code.length, source: result.source });
+      console.log("[BuildManager] build done", {
+        bytes: result.code.length,
+        model: result.model,
+        repaired: result.repaired,
+      });
     } catch (error) {
+      if (isAbortError(error)) {
+        this.state = { ...this.state, running: false, phase: null, cancelled: true };
+        this.broadcast({ kind: "cancelled" });
+        await this.mirror(true);
+        console.log("[BuildManager] build cancelled");
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.state = { ...this.state, running: false, phase: "error", error: message };
       this.broadcast({ kind: "error", message });
@@ -208,8 +179,6 @@ export class BuildManager {
   cancel() {
     this.controller?.abort();
   }
-
-  // ---- callback fan-out ----------------------------------------------------
 
   private onPhase(phase: RunPhase, detail?: string) {
     const mapped = stepForPhase(phase);
@@ -232,13 +201,6 @@ export class BuildManager {
     void this.mirror(false);
   }
 
-  // ---- storage mirror ------------------------------------------------------
-
-  /**
-   * Mirror a lightweight snapshot to storage so a tab that opens while the worker
-   * is asleep paints last-known state instantly; the heartbeat then revives the
-   * live run. Deltas go over the port; storage only gets a throttled snapshot.
-   */
   private async mirror(force: boolean) {
     const now = Date.now();
     if (!force && now - this.lastSnapshotAt < SNAPSHOT_THROTTLE_MS) {
@@ -263,13 +225,8 @@ export class BuildManager {
     await extensionStore.set(KEYS.buildSnapshot, trimmed);
   }
 
-  // ---- worker keepalive ----------------------------------------------------
-
   private startKeepalive() {
     this.keepalive ??= setInterval(() => {
-      // A cheap chrome API call resets the ~30s idle-unload timer while a turn is
-      // in flight (the in-flight session fetch does most of the work; this covers
-      // the gaps between requests).
       void browser.runtime.getPlatformInfo();
     }, KEEPALIVE_INTERVAL_MS);
   }
@@ -279,11 +236,7 @@ export class BuildManager {
     this.keepalive = null;
   }
 
-  // ---- failure surfacing ---------------------------------------------------
-
   private notifyFailure(message: string) {
-    // Only ping when nobody is watching — an open tab already shows the error
-    // inline. A headless daily build that fails otherwise vanishes silently.
     if (this.ports.size > 0) return;
     try {
       browser.notifications.create({
@@ -293,7 +246,7 @@ export class BuildManager {
         message: message.slice(0, 200),
       });
     } catch {
-      // notifications permission missing or API unavailable — nothing else to do.
+      return;
     }
   }
 }

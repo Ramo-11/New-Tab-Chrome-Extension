@@ -30,6 +30,8 @@ function reduce(state: BuildState, msg: BuildMsg): BuildState {
       return { ...state, logs: [...state.logs.slice(-LOG_RETENTION), msg.line] };
     case "done":
       return { ...state, running: false, phase: "done" };
+    case "cancelled":
+      return { ...state, running: false, phase: null, cancelled: true };
     case "error":
       return { ...state, running: false, phase: "error", error: msg.message };
   }
@@ -64,7 +66,7 @@ export function useHomepageBuild(onDone: (code: string) => void) {
       port.onDisconnect.addListener(() => {
         portRef.current = null;
         // A disconnect means the worker was torn down (update, crash, or the
-        // ~5 min port cap). Reconnecting wakes it, and its tick() reattaches to
+        // ~5 min port cap). Reconnecting wakes it, and its tick() resumes
         // any interrupted run.
         if (!disposed) setTimeout(connect, 500);
       });

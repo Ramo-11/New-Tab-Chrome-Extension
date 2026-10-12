@@ -11,10 +11,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.110.0"
-  },
   "devDependencies": {
     "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@google/genai": "2.24.0"
   }
 }

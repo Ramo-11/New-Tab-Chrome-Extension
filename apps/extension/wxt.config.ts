@@ -11,10 +11,10 @@ export default defineConfig({
       "tabs", //          getPageHtml: open pages and watch them load
       "scripting", //     getPageHtml: inject the scraper into loaded pages
       "storage", //       API key, settings, the built homepage
-      "alarms", //        heartbeat: scheduled rebuilds + reattach after a worker kill
+      "alarms", //        heartbeat: scheduled rebuilds + resume after a worker kill
       "notifications", // surface a failed headless rebuild when no tab is open
     ],
-    // Needed to scrape arbitrary pages; also exempts api.anthropic.com from CORS.
+    // Needed to scrape arbitrary pages; also covers generativelanguage.googleapis.com.
     host_permissions: ["<all_urls>"],
   },
 });

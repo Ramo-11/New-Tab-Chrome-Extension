@@ -1,5 +1,6 @@
 import type { BrowserBridge } from "@homepage/agent-core";
 import { getHistorySites } from "./history";
+import { loadSettings } from "./storage";
 import { scrapeUrls } from "./scraper";
 
 /**
@@ -8,5 +9,8 @@ import { scrapeUrls } from "./scraper";
  */
 export const browserBridge: BrowserBridge = {
   getHistory: ({ daysToAnalyze, maxResults }) => getHistorySites(daysToAnalyze, maxResults),
-  getPageHtml: ({ urls, loadDelayMs }) => scrapeUrls(urls, { loadDelay: loadDelayMs }),
+  getPageHtml: async ({ urls, loadDelayMs }) => {
+    const { openTabs } = await loadSettings();
+    return scrapeUrls(urls, { loadDelay: loadDelayMs, openTabs });
+  },
 };

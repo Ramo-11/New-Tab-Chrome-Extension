@@ -1,444 +1,390 @@
-import type Anthropic from "@anthropic-ai/sdk";
-import { buildHistoryDigest, slugifyUrl } from "./history-digest";
-import { OUTPUT_PATH, buildKickoffMessage } from "./prompt";
+import { GeminiError, MESSAGES, isAbortError, throwIfAborted } from "./errors";
+import { runWithFallback, type FallbackOptions } from "./fallback";
+import { createGeminiClient, type LlmClient } from "./gemini";
+import { buildHistoryDigest } from "./history-digest";
+import { DEFAULT_MODEL, STORAGE_KEYS, isHomepageModel, type HomepageModel } from "./models";
+import { compactPages, type CompactedPage } from "./page-compact";
+import { fallbackUrls, parsePickedUrls } from "./pick";
+import {
+  WRITE_SYSTEM_PROMPT,
+  PICK_SYSTEM_PROMPT,
+  buildPickMessage,
+  buildRepairMessage,
+  buildWriteMessage,
+} from "./prompt";
+import { allowedNewsSources, sameSite } from "./news-sources";
+import { DEFAULTS, MAX_PAGES, MAX_PERSONAL_PAGES, PICK_JSON_SCHEMA } from "./schemas";
 import { DEFAULT_BLOCKED_SITES, isAllowedUrl, isBlocked, normalizeBlockList } from "./site-filter";
-import { DEFAULTS } from "./schemas";
-import { STORAGE_KEYS, ensureAgent, ensureEnvironment, type HomepageModel } from "./setup";
+import { stripCodeFence, stripEmoji, validateHomepage } from "./validate";
 import type {
   BrowserBridge,
+  FailedPage,
   GetHistoryResult,
-  GetPageHtmlResult,
   HomepageBuildResult,
   KVStore,
-  PageRef,
   RunCallbacks,
   RunPhase,
 } from "./types";
 
-type SessionEvent = Anthropic.Beta.Sessions.BetaManagedAgentsSessionEvent;
-type CustomToolUse = Anthropic.Beta.Sessions.BetaManagedAgentsAgentCustomToolUseEvent;
-
-/** Callbacks with the optionality resolved, so call sites don't repeat `?.`. */
-interface Emit {
-  phase(phase: RunPhase, detail?: string): void;
-  text(chunk: string): void;
-  log(line: string): void;
-}
-
-const MANAGED_AGENTS_BETA = "managed-agents-2026-04-01";
-
-/** Files mount under this root no matter what path you ask for. Ask for it directly. */
-const UPLOAD_ROOT = "/mnt/session/uploads";
+export const CHECKPOINT_MAX_AGE_MS = 30 * 60 * 1000;
+export const NO_PAGES_MESSAGE =
+  "None of the chosen pages could be loaded, so there is nothing to build a homepage from. Check your connection and try again.";
+export const NO_HISTORY_MESSAGE =
+  "There isn't enough browsing history to build from yet. Browse for a little while and try again.";
 
 export interface RunOptions {
-  client: Anthropic;
+  apiKey: string;
   bridge: BrowserBridge;
   store: KVStore;
   userSystemPrompt?: string;
-  /**
-   * Hosts the tools must never read. A getter is re-read before every tool call,
-   * so a list saved mid-build applies to the rest of that build.
-   */
   blockedSites?: string[] | (() => Promise<string[]>);
-  /** Ignored when resuming: the session keeps the agent (and model) it started with. */
+  newsSources?: string[];
   model?: HomepageModel;
   callbacks?: RunCallbacks;
   signal?: AbortSignal;
-  /** Reattach to an existing session instead of creating one (e.g. after the host was killed mid-run). */
-  resumeSessionId?: string;
+  resume?: boolean;
   now?: Date;
+  checkSyntax?: (code: string) => string | null;
+  llm?: LlmClient;
 }
 
-export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildResult> {
-  const { client, bridge, store, callbacks, signal } = opts;
-  const emit: Emit = {
-    phase: (p, d) => callbacks?.onPhase?.(p, d),
-    text: (t) => callbacks?.onText?.(t),
-    log: (l) => callbacks?.onLog?.(l),
-  };
-
-  emit.phase("setup");
-  const [agentId, environmentId] = await Promise.all([
-    ensureAgent(client, store, opts.model),
-    ensureEnvironment(client, store),
-  ]);
-  emit.log(`agent=${agentId} environment=${environmentId}`);
-
-  let sessionId = opts.resumeSessionId;
-  if (!sessionId) {
-    emit.phase("session-create");
-    const session = await client.beta.sessions.create({
-      agent: agentId,
-      environment_id: environmentId,
-      title: `Homepage ${(opts.now ?? new Date()).toISOString().slice(0, 10)}`,
-    });
-    sessionId = session.id;
-    await store.set(STORAGE_KEYS.activeSessionId, sessionId);
-  }
-  emit.log(`session=${sessionId}`);
-
-  // Persist upload IDs so cleanup can still find them after a reattach.
-  const uploadedFileIds: string[] =
-    (await store.get<string[]>(STORAGE_KEYS.uploadedFileIds)) ?? [];
-  const rememberUpload = async (id: string) => {
-    uploadedFileIds.push(id);
-    await store.set(STORAGE_KEYS.uploadedFileIds, uploadedFileIds);
-  };
-
-  let finalMessage = "";
-
-  /**
-   * Every path out of here must send a result. An `agent.custom_tool_use` that
-   * never receives one leaves the session idle forever — the single
-   * unrecoverable bug in this design.
-   */
-  const dispatch = async (event: CustomToolUse): Promise<void> => {
-    try {
-      const blockedSites = normalizeBlockList(
-        (typeof opts.blockedSites === "function" ? await opts.blockedSites() : opts.blockedSites) ?? DEFAULT_BLOCKED_SITES,
-      );
-      let result: GetHistoryResult | GetPageHtmlResult;
-      switch (event.name) {
-        case "getHistory":
-          result = await runGetHistory(event, bridge, emit, blockedSites);
-          break;
-        case "getPageHtml":
-          result = await runGetPageHtml(event, { client, bridge, sessionId: sessionId!, rememberUpload, emit, blockedSites });
-          break;
-        default:
-          throw new Error(`Unknown custom tool: ${event.name}`);
-      }
-
-      await client.beta.sessions.events.send(sessionId!, {
-        events: [
-          {
-            type: "user.custom_tool_result",
-            custom_tool_use_id: event.id,
-            content: [{ type: "text", text: JSON.stringify(result) }],
-          },
-        ],
-      });
-    } catch (err) {
-      emit.log(`tool ${event.name} failed: ${String(err)}`);
-      await client.beta.sessions.events.send(sessionId!, {
-        events: [
-          {
-            type: "user.custom_tool_result",
-            custom_tool_use_id: event.id,
-            is_error: true,
-            content: [{ type: "text", text: String(err) }],
-          },
-        ],
-      });
-    }
-  };
-
-  const observe = (event: SessionEvent) => {
-    switch (event.type) {
-      case "agent.message":
-        for (const block of event.content) {
-          if (block.type === "text") {
-            finalMessage += block.text;
-            emit.text(block.text);
-          }
-        }
-        break;
-      case "agent.thinking":
-        emit.phase("thinking");
-        break;
-      case "agent.tool_use":
-        emit.phase("analyzing", event.name);
-        emit.log(`sandbox:${event.name}`);
-        break;
-      case "session.error":
-        emit.log(`session.error: ${JSON.stringify(event)}`);
-        break;
-    }
-  };
-
-  try {
-    // ---- Open the stream BEFORE anything else. It only delivers events emitted
-    // ---- after it opens; send first and the early transitions are gone.
-    let stream = await client.beta.sessions.events.stream(sessionId, undefined, { signal });
-
-    // ---- Then replay history. Covers the gap before the stream attached, and
-    // ---- is what makes a reattach lossless.
-    const history: SessionEvent[] = [];
-    for await (const event of client.beta.sessions.events.list(sessionId)) {
-      history.push(event);
-    }
-
-    const seen = new Set(history.map((e) => e.id));
-    const answered = new Set(
-      history
-        .filter((e): e is Extract<SessionEvent, { type: "user.custom_tool_result" }> =>
-          e.type === "user.custom_tool_result",
-        )
-        .map((e) => e.custom_tool_use_id),
-    );
-    const kickedOff = history.some((e) => e.type === "user.message");
-    const alreadyDone = history.some(
-      (e) => e.type === "session.status_idle" && e.stop_reason.type === "end_turn",
-    );
-
-    for (const event of history) observe(event);
-
-    if (!alreadyDone) {
-      // Re-answer any tool call that was left hanging when the stream dropped.
-      for (const event of history) {
-        if (event.type === "agent.custom_tool_use" && !answered.has(event.id)) {
-          emit.log(`re-answering orphaned tool call ${event.id}`);
-          await dispatch(event);
-        }
-      }
-
-      if (!kickedOff) {
-        await client.beta.sessions.events.send(sessionId, {
-          events: [
-            {
-              type: "user.message",
-              content: [
-                {
-                  type: "text",
-                  text: buildKickoffMessage({
-                    now: opts.now ?? new Date(),
-                    userSystemPrompt: opts.userSystemPrompt,
-                  }),
-                },
-              ],
-            },
-          ],
-        });
-      }
-
-      for await (const event of stream) {
-        if (signal?.aborted) throw new Error("aborted");
-
-        // Live-preview events carry no `id` and are never terminal. They only
-        // arrive if `event_deltas` was requested, but the stream union includes
-        // them either way — reading `.id` off one would throw.
-        if (event.type === "event_start" || event.type === "event_delta") continue;
-
-        if (!seen.has(event.id)) {
-          seen.add(event.id);
-          observe(event);
-          if (event.type === "agent.custom_tool_use") {
-            await dispatch(event);
-          }
-        }
-
-        // Terminal checks run for *every* event, including ones we've already
-        // seen. `continue`-ing on a duplicate above would skip the terminal
-        // event that arrived in the history fetch, and the loop would never end.
-        if (event.type === "session.status_terminated") break;
-        if (event.type === "session.status_idle" && event.stop_reason.type !== "requires_action") {
-          emit.log(`idle: ${event.stop_reason.type}`);
-          break;
-        }
-      }
-    }
-
-    emit.phase("writing");
-    const code = await collectDeliverable(client, sessionId, finalMessage, emit);
-    emit.phase("done");
-    return { code: code.code, sessionId, source: code.source };
-  } finally {
-    // Privacy: the event log holds every domain, title and page body we sent,
-    // and uploads persist independently of the session. Delete both, always.
-    emit.phase("cleanup");
-    await Promise.allSettled(uploadedFileIds.map((id) => client.beta.files.delete(id)));
-    await store.remove(STORAGE_KEYS.uploadedFileIds);
-    if (sessionId) {
-      await deleteSessionWhenSettled(client, sessionId).catch((err) =>
-        emit.log(`session ${sessionId} was not deleted: ${String(err)}`),
-      );
-    }
-    await store.remove(STORAGE_KEYS.activeSessionId);
-  }
+export interface BuildCheckpoint {
+  version: 1;
+  startedAt: string;
+  digest: GetHistoryResult;
+  urls: string[];
+  newsUrls?: string[];
+  pages?: CompactedPage[];
+  failed?: FailedPage[];
 }
 
-// ---------------------------------------------------------------------------
-// tool implementations
-// ---------------------------------------------------------------------------
-
-async function runGetHistory(
-  event: CustomToolUse,
-  bridge: BrowserBridge,
-  emit: Emit,
-  blockedSites: string[],
-): Promise<GetHistoryResult> {
-  const input = event.input as { daysToAnalyze?: number; maxResults?: number };
-  const daysToAnalyze = input.daysToAnalyze ?? DEFAULTS.daysToAnalyze;
-  const maxResults = input.maxResults ?? DEFAULTS.maxResults;
-
-  emit.phase("history", `${daysToAnalyze}d`);
-  const { sites, totalSitesSeen } = await bridge.getHistory({ daysToAnalyze, maxResults });
-  const allowed = sites.filter((site) => !isBlocked(site.domain, blockedSites));
-  // Blocked domains are dropped from the count too: the model is never told they exist.
-  const digest = buildHistoryDigest(allowed, {
-    daysToAnalyze,
-    maxResults,
-    totalSitesSeen: totalSitesSeen - (sites.length - allowed.length),
-  });
-  emit.log(`history: ${digest.sites.length} of ${digest.totalSitesSeen} domains`);
-  return digest;
+interface Emit {
+  phase(phase: RunPhase, detail?: string): void;
+  text(line: string): void;
+  log(line: string): void;
 }
 
-async function runGetPageHtml(
-  event: CustomToolUse,
-  ctx: {
-    client: Anthropic;
-    bridge: BrowserBridge;
-    sessionId: string;
-    rememberUpload: (id: string) => Promise<void>;
-    emit: Emit;
-    blockedSites: string[];
-  },
-): Promise<GetPageHtmlResult> {
-  const input = event.input as { urls: string[]; loadDelayMs?: number };
-  ctx.emit.phase("scraping", `${input.urls.length} pages`);
-
-  const allowed: string[] = [];
-  const blocked: GetPageHtmlResult["failed"] = [];
-  for (const url of input.urls) {
-    // Match on the URL the browser will load; malformed URLs never reach the signed-in browser.
-    if (isAllowedUrl(url, ctx.blockedSites)) allowed.push(url);
-    else blocked.push({ url, reason: "blocked by the user's settings" });
-  }
-
-  // Skip the bridge entirely when nothing is left, so no scraper window opens.
-  const { pages: loaded, failed } = allowed.length
-    ? await ctx.bridge.getPageHtml({
-        urls: allowed,
-        loadDelayMs: input.loadDelayMs ?? DEFAULTS.loadDelayMs,
-      })
-    : { pages: [], failed: [] };
-
-  // A redirect can land on a blocked host; drop what it read before anything is uploaded.
-  const pages = loaded.filter((page) => {
-    if (!page.finalUrl || isAllowedUrl(page.finalUrl, ctx.blockedSites)) return true;
-    blocked.push({ url: page.url, reason: "blocked by the user's settings" });
-    return false;
-  });
-  if (blocked.length) ctx.emit.log(`blocked: ${blocked.length} url(s)`);
-
-  const refs: PageRef[] = [];
-  const mountFailures = [...blocked, ...failed];
-
-  for (const page of pages) {
-    try {
-      const filename = `${slugifyUrl(page.url)}_${refs.length}.html`;
-      const upload = await ctx.client.beta.files.upload({
-        file: new File([page.html], filename, { type: "text/html" }),
-      });
-      await ctx.rememberUpload(upload.id);
-
-      // Mount mid-session, while the session idles awaiting this very result.
-      // The API re-roots every mount under /mnt/session/uploads (see below).
-      const resource = await ctx.client.beta.sessions.resources.add(ctx.sessionId, {
-        type: "file",
-        file_id: upload.id,
-        mount_path: `${UPLOAD_ROOT}/pages/${filename}`,
-      });
-
-      refs.push({
-        url: page.url,
-        title: page.title,
-        // The API re-roots every mount under /mnt/session/uploads. Report what it
-        // resolved, not what we asked for, or the model greps a path that isn't there.
-        mountPath: resource.mount_path,
-        bytes: page.html.length,
-      });
-      ctx.emit.log(`mounted ${page.url} -> ${resource.mount_path} (${page.html.length}b)`);
-    } catch (err) {
-      mountFailures.push({ url: page.url, reason: `mount failed: ${String(err)}` });
-    }
-  }
-
-  if (refs.length === 0 && mountFailures.length > 0 && blocked.length === 0) {
-    throw new Error(
-      `No pages could be mounted. Failures: ${mountFailures
-        .map((f) => `${f.url} (${f.reason})`)
-        .join("; ")}`,
-    );
-  }
-
-  return { pages: refs, failed: mountFailures };
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
-// ---------------------------------------------------------------------------
-// deliverable retrieval
-// ---------------------------------------------------------------------------
-
-const CODE_FENCE = /```(?:tsx|jsx|ts|js|typescript|javascript)?\s*\n([\s\S]*?)```/;
-
-/** Strip a ```tsx fence, if the model wrapped the file contents in one. */
-function stripFence(text: string): string {
-  const fenced = text.match(CODE_FENCE);
-  return (fenced ? fenced[1] : text).trim();
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
-async function collectDeliverable(
-  client: Anthropic,
-  sessionId: string,
-  finalMessage: string,
-  emit: Emit,
-): Promise<{ code: string; source: HomepageBuildResult["source"] }> {
-  // There is a short indexing lag between status_idle and outputs appearing.
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      for await (const file of client.beta.files.list({
-        scope_id: sessionId,
-        betas: [MANAGED_AGENTS_BETA],
-      })) {
-        if (!/\.(tsx|jsx|ts|js)$/.test(file.filename)) continue;
-        const response = await client.beta.files.download(file.id);
-        const text = await response.text();
-        if (text.trim()) {
-          emit.log(`deliverable from session output: ${file.filename} (${text.length}b)`);
-          return { code: stripFence(text), source: "session-output" };
-        }
-      }
-    } catch (err) {
-      emit.log(`files.list attempt ${attempt + 1} failed: ${String(err)}`);
-    }
-    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-  }
-
-  // Fallback: the model sometimes answers with the component inline instead of
-  // (or as well as) writing it. Better than failing the run outright.
-  const fenced = finalMessage.match(CODE_FENCE);
-  if (fenced && fenced[1].includes("PersonalizedHomepage")) {
-    emit.log("deliverable recovered from message fence");
-    return { code: fenced[1].trim(), source: "message-fence" };
-  }
-
-  throw new Error(
-    `Agent produced no homepage. Expected a file at ${OUTPUT_PATH}. ` +
-      `Final message: ${finalMessage.slice(0, 400)}`,
+function isCompactedPage(value: unknown): value is CompactedPage {
+  const page = asRecord(value);
+  return (
+    page !== undefined &&
+    typeof page.url === "string" &&
+    typeof page.title === "string" &&
+    typeof page.text === "string" &&
+    isStringArray(page.links)
   );
 }
 
-/**
- * A running session can't be deleted ("cannot delete while running"). After a
- * normal finish that's only the brief lag between the stream's idle and the
- * queryable status. After a cancel or error the agent is still mid-turn, so it
- * gets interrupted and has to reach a safe boundary before it goes idle.
- */
-const SETTLE_POLLS_BEFORE_INTERRUPT = 10;
-const INTERRUPT_DEADLINE_MS = 60_000;
+function isFailedPage(value: unknown): value is FailedPage {
+  const item = asRecord(value);
+  return item !== undefined && typeof item.url === "string" && typeof item.reason === "string";
+}
 
-async function deleteSessionWhenSettled(client: Anthropic, sessionId: string): Promise<void> {
-  const deadline = Date.now() + INTERRUPT_DEADLINE_MS;
-  let interrupted = false;
-  for (let attempt = 0; Date.now() < deadline; attempt++) {
-    const session = await client.beta.sessions.retrieve(sessionId);
-    if (session.status !== "running") break;
-    if (!interrupted && attempt >= SETTLE_POLLS_BEFORE_INTERRUPT) {
-      await client.beta.sessions.events.send(sessionId, { events: [{ type: "user.interrupt" }] });
-      interrupted = true;
+export function parseCheckpoint(value: unknown, now: Date): BuildCheckpoint | undefined {
+  const checkpoint = asRecord(value);
+  if (!checkpoint || checkpoint.version !== 1 || typeof checkpoint.startedAt !== "string") return undefined;
+  const started = Date.parse(checkpoint.startedAt);
+  if (!Number.isFinite(started) || now.getTime() - started > CHECKPOINT_MAX_AGE_MS) return undefined;
+  const digest = asRecord(checkpoint.digest);
+  if (!digest || !Array.isArray(digest.sites) || typeof digest.totalSitesSeen !== "number") return undefined;
+  if (!isStringArray(checkpoint.urls)) return undefined;
+  if (checkpoint.newsUrls !== undefined && !isStringArray(checkpoint.newsUrls)) return undefined;
+  if (checkpoint.pages !== undefined) {
+    if (!Array.isArray(checkpoint.pages) || !checkpoint.pages.every(isCompactedPage)) return undefined;
+    if (checkpoint.failed !== undefined && !(Array.isArray(checkpoint.failed) && checkpoint.failed.every(isFailedPage))) {
+      return undefined;
     }
-    await new Promise((r) => setTimeout(r, interrupted ? 1000 : 200));
   }
-  await client.beta.sessions.delete(sessionId);
+  return value as BuildCheckpoint;
+}
+
+export async function discardStaleCheckpoint(store: KVStore, now: Date = new Date()): Promise<void> {
+  const stored = await store.get<unknown>(STORAGE_KEYS.buildCheckpoint);
+  if (stored !== undefined && !parseCheckpoint(stored, now)) await store.remove(STORAGE_KEYS.buildCheckpoint);
+}
+
+function filterDigest(digest: GetHistoryResult, blockedSites: string[]): GetHistoryResult {
+  const sites = digest.sites.filter((site) => !isBlocked(site.domain, blockedSites));
+  return {
+    ...digest,
+    totalSitesSeen: Math.max(sites.length, digest.totalSitesSeen - (digest.sites.length - sites.length)),
+    sites,
+  };
+}
+
+function requireKey(apiKey: string | undefined): string {
+  const key = apiKey?.trim();
+  if (!key) throw new GeminiError("invalid-key", MESSAGES.noKey);
+  return key;
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildResult> {
+  const { bridge, store, callbacks, signal } = opts;
+  const emit: Emit = {
+    phase: (phase, detail) => callbacks?.onPhase?.(phase, detail),
+    text: (line) => callbacks?.onText?.(line),
+    log: (line) => callbacks?.onLog?.(line),
+  };
+  const clock = () => opts.now ?? new Date();
+  const preferred = isHomepageModel(opts.model) ? opts.model : DEFAULT_MODEL;
+  const userSystemPrompt = opts.userSystemPrompt?.trim() || undefined;
+
+  const readBlocked = async (): Promise<string[]> =>
+    normalizeBlockList(
+      (typeof opts.blockedSites === "function" ? await opts.blockedSites() : opts.blockedSites) ??
+        DEFAULT_BLOCKED_SITES,
+    );
+
+  const saveCheckpoint = async (checkpoint: BuildCheckpoint) => {
+    await store.set(STORAGE_KEYS.buildCheckpoint, checkpoint);
+  };
+
+  const fallback: FallbackOptions = {
+    store,
+    preferred,
+    signal,
+    now: clock,
+    log: emit.log,
+    demoted: new Set<string>(),
+  };
+
+  const build = async (): Promise<HomepageBuildResult> => {
+    emit.phase("setup");
+    throwIfAborted(signal);
+
+    const llm = opts.llm ?? createGeminiClient(requireKey(opts.apiKey));
+
+    const startedAt = clock().toISOString();
+    let checkpoint = opts.resume ? parseCheckpoint(await store.get<unknown>(STORAGE_KEYS.buildCheckpoint), clock()) : undefined;
+    if (opts.resume) {
+      emit.log(checkpoint ? `resuming from checkpoint (${checkpoint.pages ? "pages loaded" : "pages chosen"})` : "no usable checkpoint, starting fresh");
+    }
+
+    let blocked = await readBlocked();
+    let digest: GetHistoryResult;
+    let urls: string[];
+    let newsUrls: string[];
+
+    if (checkpoint) {
+      digest = filterDigest(checkpoint.digest, blocked);
+      urls = checkpoint.urls;
+      newsUrls = checkpoint.newsUrls ?? [];
+    } else {
+      newsUrls = allowedNewsSources(opts.newsSources ?? [], blocked);
+      emit.phase("history", `${DEFAULTS.daysToAnalyze}d`);
+      const { sites, totalSitesSeen } = await bridge.getHistory({
+        daysToAnalyze: DEFAULTS.daysToAnalyze,
+        maxResults: DEFAULTS.maxResults,
+      });
+      throwIfAborted(signal);
+      const allowed = sites.filter((site) => !isBlocked(site.domain, blocked));
+      digest = buildHistoryDigest(allowed, {
+        daysToAnalyze: DEFAULTS.daysToAnalyze,
+        maxResults: DEFAULTS.maxResults,
+        totalSitesSeen: totalSitesSeen - (sites.length - allowed.length),
+      });
+      emit.log(`history: ${digest.sites.length} of ${digest.totalSitesSeen} domains`);
+      if (digest.sites.length === 0 && newsUrls.length === 0) throw new Error(NO_HISTORY_MESSAGE);
+
+      emit.phase("thinking", "Choosing pages");
+      const maxPersonal = newsUrls.length > 0 ? MAX_PERSONAL_PAGES : MAX_PAGES;
+      let personal: string[] = [];
+      if (digest.sites.length > 0) {
+        const pick = await runWithFallback(fallback, (model) =>
+          llm.generateJson({
+            model,
+            system: PICK_SYSTEM_PROMPT,
+            user: buildPickMessage({ now: clock(), userSystemPrompt, digest, newsUrls, maxPages: maxPersonal }),
+            schema: PICK_JSON_SCHEMA,
+            signal,
+          }),
+        );
+        const notNews = (url: string) => !newsUrls.some((news) => sameSite(news, url));
+        personal = parsePickedUrls(pick.value, {
+          blockedSites: blocked,
+          digestDomains: digest.sites.map((site) => site.domain),
+          max: MAX_PAGES,
+        })
+          .filter(notNews)
+          .slice(0, maxPersonal);
+        if (personal.length === 0 && newsUrls.length === 0) {
+          personal = fallbackUrls(digest, blocked);
+          emit.log("no usable pages in the answer, using your top sites");
+        }
+      }
+      urls = [...newsUrls, ...personal];
+      if (urls.length === 0) throw new Error(NO_HISTORY_MESSAGE);
+
+      checkpoint = { version: 1, startedAt, digest, urls, newsUrls };
+      await saveCheckpoint(checkpoint);
+      emit.log(`picked: ${urls.join(", ")}`);
+      emit.text(`Picked ${plural(urls.length, "page")}.\n`);
+    }
+
+    let pages: CompactedPage[];
+    let failed: FailedPage[];
+
+    if (checkpoint.pages) {
+      pages = checkpoint.pages.filter(
+        (page) => isAllowedUrl(page.url, blocked) && (!page.finalUrl || isAllowedUrl(page.finalUrl, blocked)),
+      );
+      failed = checkpoint.failed ?? [];
+      if (pages.length === 0) throw new Error(NO_PAGES_MESSAGE);
+    } else {
+      throwIfAborted(signal);
+      blocked = await readBlocked();
+      emit.phase("scraping", plural(urls.length, "page"));
+
+      const allowedUrls = urls.filter((url) => isAllowedUrl(url, blocked));
+      const blockedCount = urls.length - allowedUrls.length;
+      const loaded = allowedUrls.length
+        ? await bridge.getPageHtml({ urls: allowedUrls, loadDelayMs: DEFAULTS.loadDelayMs })
+        : { pages: [], failed: [] };
+      throwIfAborted(signal);
+
+      const readable = loaded.pages.filter(
+        (page) => !page.finalUrl || isAllowedUrl(page.finalUrl, blocked),
+      );
+      const droppedByRedirect = loaded.pages.length - readable.length;
+      if (blockedCount + droppedByRedirect > 0) {
+        emit.log(`blocked: ${blockedCount + droppedByRedirect} url(s)`);
+      }
+
+      emit.phase("analyzing", plural(readable.length, "page"));
+      const compacted = compactPages(
+        readable.map((page) => ({ url: page.url, finalUrl: page.finalUrl, title: page.title, html: page.html })),
+      );
+      pages = compacted.filter((page) => page.text.trim().length > 0);
+      failed = [
+        ...loaded.failed,
+        ...compacted
+          .filter((page) => page.text.trim().length === 0)
+          .map((page) => ({ url: page.url, reason: "no readable content" })),
+      ];
+      if (pages.length === 0) throw new Error(NO_PAGES_MESSAGE);
+
+      checkpoint = { ...checkpoint, pages, failed };
+      await saveCheckpoint(checkpoint);
+      emit.log(`read ${pages.length} of ${urls.length} pages`);
+      emit.text(
+        failed.length > 0
+          ? `Read ${plural(pages.length, "page")}, ${failed.length} could not be loaded.\n`
+          : `Read ${plural(pages.length, "page")}.\n`,
+      );
+    }
+
+    const knownLinks = new Set<string>();
+    for (const page of pages) {
+      knownLinks.add(page.url);
+      if (page.finalUrl) knownLinks.add(page.finalUrl);
+      for (const link of page.links) knownLinks.add(link);
+    }
+    const sourceUrls = pages.map((page) => page.finalUrl ?? page.url);
+
+    emit.phase("writing");
+    emit.text("Writing your homepage...\n");
+    throwIfAborted(signal);
+
+    let logged = 0;
+    const draft = await runWithFallback(fallback, (model) => {
+      logged = 0;
+      return llm.generateText({
+        model,
+        system: WRITE_SYSTEM_PROMPT,
+        user: buildWriteMessage({
+          now: clock(),
+          userSystemPrompt,
+          digest,
+          pages,
+          failed,
+          newsUrls,
+        }),
+        signal,
+        onProgress: (chars) => {
+          if (chars - logged >= 4000) {
+            logged = chars;
+            emit.log(`writing: ${chars} characters`);
+          }
+        },
+      });
+    });
+
+    let code = stripEmoji(stripCodeFence(draft.value.text));
+    let model = draft.model;
+    let repaired = false;
+    let report = validateHomepage(code, {
+      knownLinks,
+      checkSyntax: opts.checkSyntax,
+      truncated: draft.value.truncated,
+    });
+
+    if (report.problems.length > 0) {
+      for (const problem of report.problems) emit.log(`check: ${problem}`);
+      emit.phase("writing", "Checking the result");
+      emit.text("Checking the result and fixing a few details...\n");
+      try {
+        const fix = await runWithFallback(fallback, (candidate) =>
+          llm.generateText({
+            model: candidate,
+            system: WRITE_SYSTEM_PROMPT,
+            user: buildRepairMessage({ code, problems: report.problems, sourceUrls }),
+            signal,
+          }),
+        );
+        const fixedCode = stripEmoji(stripCodeFence(fix.value.text));
+        const fixedReport = validateHomepage(fixedCode, {
+          knownLinks,
+          checkSyntax: opts.checkSyntax,
+          truncated: fix.value.truncated,
+        });
+        if (fixedReport.blocking.length === 0) {
+          code = fixedCode;
+          report = fixedReport;
+          model = fix.model;
+          repaired = true;
+        } else if (report.blocking.length > 0) {
+          throw new Error(
+            `The homepage that came back was not usable: ${fixedReport.blocking[0]} Try building again.`,
+          );
+        } else {
+          emit.log("the fixed version was worse, keeping the first draft");
+        }
+      } catch (error) {
+        if (isAbortError(error) || report.blocking.length > 0) throw error;
+        emit.log(`could not fix the draft, keeping it as it is: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (report.unverifiedLinks.length > 0) {
+      emit.log(`${plural(report.unverifiedLinks.length, "link")} could not be matched to the loaded pages`);
+    }
+
+    return { code, model, repaired };
+  };
+
+  let result: HomepageBuildResult;
+  try {
+    result = await build();
+  } finally {
+    emit.phase("cleanup");
+    await store.remove(STORAGE_KEYS.buildCheckpoint).catch((error: unknown) => {
+      emit.log(`could not clear the checkpoint: ${String(error)}`);
+    });
+  }
+  emit.phase("done");
+  return result;
 }

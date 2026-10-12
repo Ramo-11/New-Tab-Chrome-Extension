@@ -19,6 +19,7 @@ export interface BuildState {
   narration: string;
   logs: string[];
   error: string | null;
+  cancelled: boolean;
 }
 
 export const INITIAL_BUILD_STATE: BuildState = {
@@ -29,6 +30,7 @@ export const INITIAL_BUILD_STATE: BuildState = {
   narration: "",
   logs: [],
   error: null,
+  cancelled: false,
 };
 
 /** How many recent log lines are kept (and shown). */
@@ -47,19 +49,19 @@ export type BuildMsg =
   | { kind: "text"; chunk: string } // narration delta
   | { kind: "log"; line: string }
   | { kind: "done"; code: string } // homepage saved; carries the raw TSX
+  | { kind: "cancelled" }
   | { kind: "error"; message: string };
 
 /**
- * The five stages a person cares about. The agent emits finer-grained phases
- * that interleave (thinking ↔ analyzing fire repeatedly); each maps to a step
- * here. `thinking` and `error` deliberately map to none, so they never move the
- * stepper.
+ * The stages a person cares about. The engine emits finer-grained phases; each
+ * maps to one step here, and `error` maps to none so it never moves the stepper.
  */
 export const BUILD_STEPS: { label: string; phases: RunPhase[] }[] = [
-  { label: "Preparing agent", phases: ["setup", "session-create"] },
+  { label: "Getting ready", phases: ["setup"] },
   { label: "Reading your history", phases: ["history"] },
+  { label: "Choosing pages", phases: ["thinking"] },
   { label: "Opening pages in your browser", phases: ["scraping"] },
-  { label: "Analyzing pages", phases: ["analyzing"] },
+  { label: "Reading the pages", phases: ["analyzing"] },
   { label: "Writing your homepage", phases: ["writing", "cleanup", "done"] },
 ];
 

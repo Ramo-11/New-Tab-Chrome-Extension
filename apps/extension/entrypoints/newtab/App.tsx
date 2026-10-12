@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
-import { DEFAULT_MODEL, DEFAULT_BLOCKED_SITES, type HomepageModel } from "@homepage/agent-core";
+import { DEFAULT_MODEL, DEFAULT_BLOCKED_SITES, DEFAULT_NEWS_SOURCES, type HomepageModel } from "@homepage/agent-core";
 import { DEFAULT_REBUILD_INTERVAL_HOURS } from "@/lib/auto-rebuild";
 import { BUILD_STEPS } from "@/lib/protocol";
-import { KEYS, extensionStore, loadHomepage, loadSettings, saveSetting } from "@/lib/storage";
+import { hasFreshCheckpoint, loadHomepage, loadSettings, saveSetting } from "@/lib/storage";
 import { toRenderable } from "@/lib/transpile";
 import { ApiKeySetup } from "./components/ApiKeySetup";
 import { BuildProgress } from "./components/BuildProgress";
 import { HomepagePreview } from "./components/HomepagePreview";
 import { SettingsModal } from "./components/SettingsModal";
-import { btn, errorBox } from "./components/ui";
+import { btn, btnSecondary, errorBox, noteBox } from "./components/ui";
 import { useHomepageBuild } from "./useHomepageBuild";
 
 export default function App() {
@@ -16,24 +16,35 @@ export default function App() {
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [blockedSites, setBlockedSites] = useState<string[]>(DEFAULT_BLOCKED_SITES);
+  const [newsSources, setNewsSources] = useState<string[]>(DEFAULT_NEWS_SOURCES);
   const [model, setModel] = useState<HomepageModel>(DEFAULT_MODEL);
   const [autoRebuild, setAutoRebuild] = useState(true);
+  const [openTabs, setOpenTabs] = useState(false);
   const [intervalHours, setIntervalHours] = useState(DEFAULT_REBUILD_INTERVAL_HOURS);
   /** Transpiled homepage, ready for Sandpack. */
   const [renderedCode, setRenderedCode] = useState<string | null>(null);
-  /** A session left mid-flight, offered as "Resume interrupted build". */
-  const [resumable, setResumable] = useState<string | null>(null);
+  /** A build left mid-flight, offered as "Resume interrupted build". */
+  const [resumable, setResumable] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   /** Expand the full progress view over an existing homepage. */
   const [viewProgress, setViewProgress] = useState(false);
   /** The error the user dismissed, so a stale banner doesn't linger. */
   const [dismissedError, setDismissedError] = useState<string | null>(null);
+  const [builtAt, setBuiltAt] = useState<Date | null>(null);
 
-  const { state, build, cancel } = useHomepageBuild((code) => setRenderedCode(toRenderable(code)));
+  const { state, build, cancel } = useHomepageBuild((code) => {
+    setRenderedCode(toRenderable(code));
+    setBuiltAt(new Date());
+  });
 
   // Once a build finishes, drop back to the homepage view.
   useEffect(() => {
     if (!state.running) setViewProgress(false);
+  }, [state.running]);
+
+  useEffect(() => {
+    if (state.running) return;
+    void hasFreshCheckpoint().then(setResumable);
   }, [state.running]);
 
   // Scheduled rebuilds are driven by the worker's alarm, not by opening a tab;
@@ -41,19 +52,19 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [settings, homepage, activeSession] = await Promise.all([
-          loadSettings(),
-          loadHomepage(),
-          extensionStore.get<string>(KEYS.activeSessionId),
-        ]);
+        const [settings, homepage] = await Promise.all([loadSettings(), loadHomepage()]);
         setApiKey(settings.apiKey);
         setSystemPrompt(settings.systemPrompt);
         setBlockedSites(settings.blockedSites);
+        setNewsSources(settings.newsSources);
         setModel(settings.model);
         setAutoRebuild(settings.autoRebuild);
+        setOpenTabs(settings.openTabs);
         setIntervalHours(settings.rebuildIntervalHours ?? DEFAULT_REBUILD_INTERVAL_HOURS);
-        setResumable(activeSession ?? null);
-        if (homepage?.code) setRenderedCode(toRenderable(homepage.code));
+        if (homepage?.code) {
+          setRenderedCode(toRenderable(homepage.code));
+          setBuiltAt(new Date(homepage.timestamp));
+        }
       } finally {
         setLoading(false);
       }
@@ -66,9 +77,14 @@ export default function App() {
   }, []);
 
   const savePrompt = useCallback(
-    async (prompt: string, sites: string[]) => {
-      await Promise.all([saveSetting("systemPrompt", prompt), saveSetting("blockedSites", sites)]);
+    async (prompt: string, sites: string[], news: string[]) => {
+      await Promise.all([
+        saveSetting("systemPrompt", prompt),
+        saveSetting("blockedSites", sites),
+        saveSetting("newsSources", news),
+      ]);
       setBlockedSites(sites);
+      setNewsSources(news);
       setSystemPrompt(prompt);
       setShowSettings(false);
       setRenderedCode(null);
@@ -86,6 +102,10 @@ export default function App() {
     setAutoRebuild(next);
     await saveSetting("autoRebuild", next);
   }, []);
+  const toggleOpenTabs = useCallback(async (next: boolean) => {
+    setOpenTabs(next);
+    await saveSetting("openTabs", next);
+  }, []);
   const changeInterval = useCallback(async (next: number) => {
     setIntervalHours(next);
     await saveSetting("rebuildIntervalHours", next);
@@ -93,6 +113,26 @@ export default function App() {
 
   if (loading) return <div style={{ padding: 20, textAlign: "center" }}>Loading…</div>;
   if (!apiKey) return <ApiKeySetup onSave={saveKey} />;
+
+  const settingsModal = showSettings && (
+    <SettingsModal
+      initialPrompt={systemPrompt}
+      blockedSites={blockedSites}
+      newsSources={newsSources}
+      apiKey={apiKey}
+      onChangeApiKey={saveKey}
+      model={model}
+      onChangeModel={changeModel}
+      autoRebuild={autoRebuild}
+      openTabs={openTabs}
+      onToggleOpenTabs={toggleOpenTabs}
+      onToggleAutoRebuild={toggleAutoRebuild}
+      intervalHours={intervalHours}
+      onChangeInterval={changeInterval}
+      onClose={() => setShowSettings(false)}
+      onSave={savePrompt}
+    />
+  );
 
   // With no homepage to fall back to, a running build takes over the tab.
   if (state.running && (!renderedCode || viewProgress)) {
@@ -116,7 +156,12 @@ export default function App() {
         {state.error && (
           <div style={{ ...errorBox, margin: "16px 0", padding: 12, borderRadius: 4 }}>{state.error}</div>
         )}
-        <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
+        {state.cancelled && !state.error && (
+          <div style={{ ...noteBox, margin: "16px 0", padding: 12 }}>
+            Build cancelled. You can build again whenever you are ready.
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 12, marginTop: 16, flexWrap: "wrap" }}>
           <button style={btn} onClick={() => build()}>
             Build today&apos;s homepage
           </button>
@@ -125,7 +170,11 @@ export default function App() {
               Resume interrupted build
             </button>
           )}
+          <button style={btnSecondary} onClick={() => setShowSettings(true)}>
+            Settings
+          </button>
         </div>
+        {settingsModal}
       </div>
     );
   }
@@ -133,92 +182,59 @@ export default function App() {
   const showError = state.error && dismissedError !== state.error;
 
   return (
-    <div style={{ height: "100vh", width: "100vw" }}>
-      <div style={{ position: "fixed", top: 20, right: 20, zIndex: 999, display: "flex", gap: 8 }}>
+    <div className="hb-shell">
+      <div className="hb-toolbar">
         {state.running ? (
-          // A build is running in the background (from here, another tab, or the
-          // scheduled rebuild). Let the user watch it without losing this page.
-          <button
-            style={{ ...btn, backgroundColor: "#0a7", display: "flex", alignItems: "center", gap: 8 }}
-            onClick={() => setViewProgress(true)}
-            title="View build progress"
-          >
-            <span
-              style={{
-                width: 8,
-                height: 8,
-                borderRadius: "50%",
-                background: "white",
-                animation: "hb-pulse 1.2s ease-in-out infinite",
-              }}
-            />
-            Building… {Math.min(state.stepIndex + 1, BUILD_STEPS.length)}/{BUILD_STEPS.length}
+          <button className="hb-status hb-status-live" onClick={() => setViewProgress(true)} title="View build progress">
+            <span className="hb-dot" />
+            Building, step {Math.min(state.stepIndex + 1, BUILD_STEPS.length)} of {BUILD_STEPS.length}
           </button>
         ) : (
-          <button style={btn} onClick={() => build()} title="Rebuild now">
-            ↻ Rebuild
-          </button>
+          <span className="hb-status">{builtAt ? `Updated ${formatBuiltAt(builtAt)}` : "AI Homepage"}</span>
         )}
-        <button style={btn} onClick={() => setShowSettings(true)} title="Customize homepage">
-          ⚙️ Settings
-        </button>
+        <div className="hb-actions">
+          {!state.running && (
+            <button className="hb-tool-btn" onClick={() => build()}>
+              Rebuild
+            </button>
+          )}
+          <button className="hb-tool-btn" onClick={() => setShowSettings(true)}>
+            Settings
+          </button>
+        </div>
       </div>
 
       {showError && (
-        <div
-          style={{
-            ...errorBox,
-            position: "fixed",
-            top: 20,
-            left: 20,
-            right: 260,
-            zIndex: 999,
-            padding: "10px 14px",
-            borderRadius: 6,
-            display: "flex",
-            alignItems: "flex-start",
-            gap: 12,
-          }}
-        >
-          <span style={{ flex: 1 }}>
+        <div className="hb-error-bar" role="alert">
+          <span>
             <b>Build failed.</b> {state.error}
           </span>
-          <button style={{ ...btn, padding: "4px 10px", backgroundColor: "#a02620" }} onClick={() => build()}>
-            Retry
-          </button>
-          <button
-            onClick={() => setDismissedError(state.error)}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "#a02620",
-              cursor: "pointer",
-              fontSize: 16,
-              lineHeight: 1,
-            }}
-            title="Dismiss"
-          >
-            ✕
-          </button>
+          <div className="hb-actions">
+            <button className="hb-tool-btn" onClick={() => build()}>
+              Retry
+            </button>
+            <button className="hb-tool-btn" onClick={() => setDismissedError(state.error)}>
+              Dismiss
+            </button>
+          </div>
         </div>
       )}
 
-      <HomepagePreview code={renderedCode} />
+      <div className="hb-page">
+        <HomepagePreview code={renderedCode} />
+      </div>
 
-      {showSettings && (
-        <SettingsModal
-          initialPrompt={systemPrompt}
-          blockedSites={blockedSites}
-          model={model}
-          onChangeModel={changeModel}
-          autoRebuild={autoRebuild}
-          onToggleAutoRebuild={toggleAutoRebuild}
-          intervalHours={intervalHours}
-          onChangeInterval={changeInterval}
-          onClose={() => setShowSettings(false)}
-          onSave={savePrompt}
-        />
-      )}
+      {settingsModal}
     </div>
   );
+}
+
+function formatBuiltAt(date: Date): string {
+  const time = date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) return `today at ${time}`;
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return `yesterday at ${time}`;
+  return `${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })} at ${time}`;
 }

@@ -3,7 +3,8 @@
  * of the system the Bun harness can't reach:
  *
  *   1. the MV3 service worker registers,
- *   2. the new-tab override renders (the API-key screen on a fresh profile),
+ *   2. the new-tab override renders (the Google API-key screen on a fresh profile)
+ *      and rejects a non-Google key inline,
  *   3. the worker answers `subscribe` on the build port with a snapshot,
  *   4. `startBuild` with no API key fails cleanly with an error message,
  *   5. `chrome.history` is readable, so the `history` permission is real.
@@ -151,9 +152,25 @@ try {
   await sleep(2500); // let React mount
   const bodyText = await page.evaluate<string>("document.body.innerText");
   check(
-    "renders the API-key setup screen",
-    /Connect your Anthropic API key/i.test(bodyText),
+    "renders the Google API-key setup screen",
+    /Connect your free Google AI key/i.test(bodyText) && /aistudio\.google\.com\/apikey/i.test(bodyText),
     bodyText.split("\n").filter(Boolean)[0]?.slice(0, 50),
+  );
+
+  await page.evaluate<void>(`
+    (() => {
+      const input = document.querySelector("input");
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+      set.call(input, "sk-ant-not-a-google-key");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      [...document.querySelectorAll("button")].find((b) => /save key/i.test(b.textContent)).click();
+    })()
+  `);
+  await sleep(500);
+  const afterBadKey = await page.evaluate<string>("document.body.innerText");
+  check(
+    "a non-Google key is rejected inline and the setup screen stays",
+    /doesn't look like a Google AI Studio key/i.test(afterBadKey) && /Connect your free Google AI key/i.test(afterBadKey),
   );
 
   // Open a build port, send one message, and collect replies for a moment.
@@ -180,7 +197,7 @@ try {
   // ---- 4. startBuild without a key fails cleanly ----------------------------
   const started = await talk({ kind: "startBuild" }, 3000);
   const error = started.find((m) => m.kind === "error");
-  check("startBuild with no API key reports an error", /API key/i.test(error?.message ?? ""), error?.message);
+  check("startBuild with no API key reports an error", /Google API key/i.test(error?.message ?? ""), error?.message);
 
   // ---- 5. chrome.history is readable ---------------------------------------
   const domains = await page.evaluate<string[]>(`

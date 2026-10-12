@@ -50,7 +50,6 @@ describe("buildHistoryDigest", () => {
 
   test("stays small enough to sit inline in a tool result", () => {
     const digest = buildHistoryDigest(sites, { daysToAnalyze: 14, maxResults: 30 });
-    // ~4 chars/token: a few thousand tokens, not millions.
     expect(JSON.stringify(digest).length).toBeLessThan(40_000);
   });
 });
